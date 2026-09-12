@@ -7,6 +7,9 @@ use Illuminate\JsonSchema\JsonSchemaTypeFactory;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
+use Laravel\Ai\Attributes\CacheInstructions;
+use Laravel\Ai\Attributes\CacheToolDefinitions;
 use Laravel\Ai\Contracts\Gateway\EmbeddingGateway;
 use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
@@ -252,7 +255,7 @@ class BedrockTextGateway implements EmbeddingGateway, StepTextGateway
         $hasReasoningBlocks = false;
         $stopReason = 'stop';
 
-        $emitTextStart = function () use (&$textId, $invocationId, $timestamp): ?\Laravel\Ai\Streaming\Events\StreamEvent {
+        $emitTextStart = function () use (&$textId, $invocationId, $timestamp): ?StreamEvent {
             if ($textId !== '') {
                 return null;
             }
@@ -266,7 +269,7 @@ class BedrockTextGateway implements EmbeddingGateway, StepTextGateway
             ))->withInvocationId($invocationId);
         };
 
-        $emitReasoningStart = function () use (&$reasoningId, $invocationId, $timestamp): ?\Laravel\Ai\Streaming\Events\StreamEvent {
+        $emitReasoningStart = function () use (&$reasoningId, $invocationId, $timestamp): ?StreamEvent {
             if ($reasoningId !== '') {
                 return null;
             }
@@ -576,10 +579,13 @@ class BedrockTextGateway implements EmbeddingGateway, StepTextGateway
             throw BedrockException::toAiException($throwable, $provider->name(), $model);
         }
 
-        // Cohere's Bedrock responses carry no usage, so no input token count is available.
+        // Cohere's Bedrock response body carries no usage, but the input token
+        // count is reported in the `x-amzn-bedrock-input-token-count` header.
+        $inputTokens = (int) ($response->get('@metadata')['headers']['x-amzn-bedrock-input-token-count'] ?? 0);
+
         return new EmbeddingsResponse(
             $this->parseCohereEmbeddings($result['embeddings'] ?? []),
-            0,
+            $inputTokens,
             new Meta($provider->name(), $model),
         );
     }
@@ -642,6 +648,8 @@ class BedrockTextGateway implements EmbeddingGateway, StepTextGateway
             'messages' => $conversationMessages,
         ];
 
+        $providerOptions = $options?->providerOptions(Lab::Bedrock) ?? [];
+
         if ($instructions) {
             $parameters['system'] = [['text' => $instructions]];
         }
@@ -658,13 +666,39 @@ class BedrockTextGateway implements EmbeddingGateway, StepTextGateway
             $parameters['inferenceConfig'] = $inferenceConfig;
         }
 
-        $providerOptions = $options?->providerOptions(Lab::Bedrock);
+        $parameters = array_merge($parameters, $providerOptions);
 
-        if (! empty($providerOptions)) {
-            return array_merge($parameters, $providerOptions);
+        $this->ensureValidPromptCacheOrder($options);
+
+        if (isset($parameters['system']) && $options?->cacheInstructions instanceof CacheInstructions) {
+            $parameters['system'][] = $this->cachePoint($options->cacheInstructions->ttl);
+        }
+
+        if (isset($parameters['toolConfig']['tools']) && $options?->cacheToolDefinitions instanceof CacheToolDefinitions) {
+            $parameters['toolConfig']['tools'][] = $this->cachePoint($options->cacheToolDefinitions->ttl);
         }
 
         return $parameters;
+    }
+
+    /**
+     * Ensure longer-lived cache points precede shorter-lived cache points.
+     */
+    protected function ensureValidPromptCacheOrder(?TextGenerationOptions $options): void
+    {
+        if ($options?->cacheInstructions?->ttl === '1h'
+            && $options->cacheToolDefinitions instanceof CacheToolDefinitions
+            && $options->cacheToolDefinitions->ttl !== '1h') {
+            throw new InvalidArgumentException('A one-hour instructions cache requires the tool definitions cache to also use a one-hour TTL.');
+        }
+    }
+
+    /**
+     * Build a Bedrock cache point for the requested TTL.
+     */
+    protected function cachePoint(?string $ttl): array
+    {
+        return ['cachePoint' => Arr::whereNotNull(['type' => 'default', 'ttl' => $ttl])];
     }
 
     /**

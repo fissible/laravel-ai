@@ -55,7 +55,7 @@ trait HandlesTextStreaming
         $usage = null;
         $stopReason = '';
 
-        $emitTextStart = function () use (&$textStartEmitted, &$messageId, $invocationId): ?\Laravel\Ai\Streaming\Events\StreamEvent {
+        $emitTextStart = function () use (&$textStartEmitted, &$messageId, $invocationId): ?StreamEvent {
             if ($textStartEmitted) {
                 return null;
             }
@@ -69,7 +69,7 @@ trait HandlesTextStreaming
             ))->withInvocationId($invocationId);
         };
 
-        $emitReasoningStart = function () use (&$reasoningStartEmitted, &$reasoningId, $invocationId): ?\Laravel\Ai\Streaming\Events\StreamEvent {
+        $emitReasoningStart = function () use (&$reasoningStartEmitted, &$reasoningId, $invocationId): ?StreamEvent {
             if ($reasoningStartEmitted) {
                 return null;
             }
@@ -324,6 +324,11 @@ trait HandlesTextStreaming
             if ($type === 'message_delta') {
                 $stopReason = $data['delta']['stop_reason'] ?? '';
                 $deltaUsage = $data['usage'] ?? [];
+
+                // Usage on message_delta is cumulative for the whole message...
+                $inputTokens = $deltaUsage['input_tokens'] ?? $inputTokens;
+                $cacheCreationTokens = $deltaUsage['cache_creation_input_tokens'] ?? $cacheCreationTokens;
+                $cacheReadTokens = $deltaUsage['cache_read_input_tokens'] ?? $cacheReadTokens;
 
                 $usage = new Usage(
                     $inputTokens,
